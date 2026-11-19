@@ -1,0 +1,9 @@
+Build: PASS (GCC, GNU11, libpng 1.6.48)
+Round-trip validation on supplied PNG samples:
+img1.png: PASS; exact gray equality on all alpha-valid pixels; alpha identical
+img2.png: PASS; exact gray equality on all alpha-valid pixels; alpha identical
+img3.png: PASS; exact gray equality on all alpha-valid pixels; alpha identical
+img4.png: PASS; exact gray equality on all alpha-valid pixels; alpha identical
+img5.png: PASS; exact gray equality on all alpha-valid pixels; alpha identical
+
+Note: These are C encoder -> C decoder tests. No byte-for-byte comparison against an Octave-generated .wtc was performed.

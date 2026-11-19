@@ -1,0 +1,3 @@
+#include "watercolumn.h"
+
+int main(int argc,char**argv){if(argc!=3){fprintf(stderr,"Usage: %s input.png output.wtc\n",argv[0]);return 2;}WCImage im;if(!png_read_wc(argv[1],&im)){fprintf(stderr,"Cannot read PNG: %s\n",argv[1]);return 1;}int ok=wc_encode(&im,argv[2]);wc_free_image(&im);if(!ok){fprintf(stderr,"Encoding failed (unsupported dimensions, insufficient LS samples, or invalid data).\n");return 1;}return 0;}

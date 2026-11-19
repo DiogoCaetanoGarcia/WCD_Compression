@@ -1,0 +1,21 @@
+#include "watercolumn.h"
+#include <png.h>
+#include <stdlib.h>
+#include <string.h>
+int png_read_wc(const char*fn,WCImage*im){
+ memset(im,0,sizeof(*im));png_image p;memset(&p,0,sizeof(p));p.version=PNG_IMAGE_VERSION;
+ if(!png_image_begin_read_from_file(&p,fn))return 0;
+ if(p.width>UINT32_MAX||p.height>UINT32_MAX){png_image_free(&p);return 0;}
+ im->w=p.width;im->h=p.height;size_t n=(size_t)im->w*im->h;
+ p.format=PNG_FORMAT_GA;uint8_t*b=malloc(2*n);im->v=malloc(n);im->valid=malloc(n);
+ if(!b||!im->v||!im->valid||!png_image_finish_read(&p,NULL,b,0,NULL)){free(b);png_image_free(&p);return 0;}
+ for(uint32_t y=0;y<im->h;y++)for(uint32_t x=0;x<im->w;x++){size_t s=2*((size_t)y*im->w+x),d=(size_t)y+(size_t)x*im->h;im->v[d]=(int8_t)((int)b[s]-128);im->valid[d]=(b[s+1]!=0);}
+ free(b);png_image_free(&p);return 1;
+}
+int png_write_wc(const char*fn,const WCImage*im){
+ png_image p;memset(&p,0,sizeof(p));p.version=PNG_IMAGE_VERSION;p.width=im->w;p.height=im->h;p.format=PNG_FORMAT_GA;
+ size_t n=(size_t)im->w*im->h;uint8_t*b=malloc(2*n);if(!b)return 0;
+ for(uint32_t y=0;y<im->h;y++)for(uint32_t x=0;x<im->w;x++){size_t d=(size_t)y+(size_t)x*im->h,s=2*((size_t)y*im->w+x);b[s]=(uint8_t)((int)im->v[d]+128);b[s+1]=im->valid[d]?255:0;}
+ int ok=png_image_write_to_file(&p,fn,0,b,0,NULL);free(b);return ok;
+}
+void wc_free_image(WCImage*im){if(im){free(im->v);free(im->valid);memset(im,0,sizeof(*im));}}

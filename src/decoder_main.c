@@ -1,0 +1,24 @@
+#include "watercolumn.h"
+
+int main(int argc,char**argv)
+{
+	if(argc!=4)
+	{
+		fprintf(stderr,"Usage: %s original.png input.wtc reconstructed.png\n",argv[0]);
+		return 2;
+	}
+	WCImage im;
+	if(!png_read_wc(argv[1],&im))
+	{
+		fprintf(stderr,"Cannot read original PNG mask: %s\n",argv[1]);
+		return 1;
+	}
+	int ok=wc_decode(&im,argv[2],argv[3]);
+	wc_free_image(&im);
+	if(!ok)
+	{
+		fprintf(stderr,"Decoding failed: malformed/incompatible bitstream or unsupported predictor border.\n");
+		return 1;
+	}
+	return 0;
+}

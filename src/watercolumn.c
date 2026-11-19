@@ -1,0 +1,729 @@
+#include "watercolumn.h"
+#include "arith.h"
+#include "octree.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <limits.h>
+
+static int reserve(Buf*b, size_t z)
+{
+	if(b->n+z<=b->c)return 1;
+	size_t c=b->c?b->c:256;
+	while(c<b->n+z)c*=2;
+	void*q=realloc(b->p,c);
+	if(!q)return 0;
+	b->p=q;
+	b->c=c;
+	return 1;
+}
+
+static int add(Buf*b, const void*p, size_t n)
+{
+	if(!reserve(b,n))
+		return 0;
+	memcpy(b->p+b->n,p,n);
+	b->n+=n;
+	return 1;
+}
+
+static int byte(Buf*b, uint8_t x)
+{
+	return add(b,&x,1);
+}
+
+static uint64_t getle(const uint8_t*p, size_t n)
+{
+	uint64_t v=0;
+	for(size_t i=0; i<n; i++)
+		v|=(uint64_t)p[i]<<(8*i);
+	return v;
+}
+
+static int putle(Buf*b, uint64_t v, size_t n)
+{
+	for(size_t i=0; i<n; i++)
+		if(!byte(b,(uint8_t)(v>>(8*i))))
+			return 0;
+	return 1;
+}
+
+static size_t nbytes_for(uint64_t n)
+{
+	size_t b=0;
+	uint64_t v=n;
+	do
+	{
+		b++;
+		v>>=8;
+	}while(v);
+	return b;
+}
+
+static int pack_counts(const uint64_t*f, unsigned bits, uint8_t**out, size_t*outn)
+{
+	size_t nb = (255u*bits+7)/8;
+	uint8_t*p = calloc(nb,1);
+	if(!p)
+		return 0;
+	size_t k=0;
+	for(int i=0; i<255; i++)
+		for(int j=(int)bits-1; j>=0; j--)
+		{
+			if((f[i]>>j)&1)
+				p[k/8]|=(uint8_t)(1u<<(7-(k%8)));
+			k++;
+		}
+	*out=p;
+	*outn=nb;
+	return 1;
+}
+
+static int unpack_counts(const uint8_t*p, unsigned bits, uint64_t*f)
+{
+	size_t k=0;
+	for(int i=0; i<255; i++)
+	{
+		uint64_t v=0;
+		for(unsigned j=0; j<bits; j++)
+		{
+			v = (v<<1)|((p[k/8]>>(7-(k%8)))&1);
+			k++;
+		}
+		f[i]=v;
+	}
+	return 1;
+}
+
+static double rnd_oct(double x)
+{
+	return x>=0?floor(x+0.5):ceil(x-0.5);
+}
+
+static int8_t sat8(double x)
+{
+	if(x>127)
+		x=127;
+	if(x< -128)
+		x=-128;
+	return (int8_t)x;
+}
+
+static size_t ix(uint32_t r,uint32_t c,uint32_t h)
+{
+	return (size_t)r+(size_t)c*h;
+}
+
+/* Householder QR least-squares solve, matching the column-major Octave design matrix. */
+static int fit_ls(const int8_t*a, const uint8_t*valid, uint32_t h, uint32_t w, int H0, int W0, double*t)
+{
+	int K=H0*W0-1;
+	size_t M=0;
+	for(uint32_t c=W0-1; c<w; c++)
+		for(uint32_t r=H0-1; r<h; r++)
+		{
+			int ok=1;
+			for(int k1=0; k1<H0; k1++)
+				for(int k2=0; k2<W0; k2++)
+					if(!valid[ix(r-k1,c-k2,h)])
+						ok=0;
+			if(ok)
+				M++;
+		}
+	if(M<(size_t)K)
+		return 0;
+	double *A = calloc(M*(size_t)K,sizeof(double)), *b = calloc(M,sizeof(double));
+	if(!A||!b)
+	{
+		free(A);
+		free(b);
+		return 0;
+	}
+	size_t m=0;
+	for(uint32_t c=W0-1; c<w; c++)
+		for(uint32_t r=H0-1; r<h; r++)
+		{
+			int ok=1;
+			for(int k1=0; k1<H0; k1++)
+				for(int k2=0; k2<W0; k2++)
+					if(!valid[ix(r-k1,c-k2,h)])
+						ok=0;
+			if(!ok)
+				continue;
+			b[m] = a[ix(r,c,h)];
+			int col=0;
+			for(int k1=0; k1<H0; k1++)
+				for(int k2=0; k2<W0; k2++)
+				{
+					if(k1==0&&k2==0)
+						continue;
+					A[m*(size_t)K+col++]=a[ix(r-k1,c-k2,h)];
+				}
+			m++;
+		}
+	for(int k=0; k<K; k++)
+	{
+		double norm=0;
+		for(size_t i=k; i<M; i++)
+		{
+			double z = A[i*(size_t)K+k];
+			norm = hypot(norm,z);
+		}
+		if(norm<1e-12)
+		{
+			free(A);
+			free(b);
+			return 0;
+		}
+		double x = A[k*(size_t)K+k], alpha=x>=0?-norm:norm;
+		double v0=x-alpha;
+		A[k*(size_t)K+k]=alpha;
+		for(size_t i=k+1; i<M; i++)
+			A[i*(size_t)K+k]/=v0;
+		double tau=(alpha-x)/alpha;
+		for(int j=k+1; j<K; j++)
+		{
+			double dot = A[k*(size_t)K+j];
+			for(size_t i=k+1; i<M; i++)
+				dot+=A[i*(size_t)K+k]*A[i*(size_t)K+j];
+			dot*=tau;
+			A[k*(size_t)K+j]-=dot;
+			for(size_t i=k+1; i<M; i++)
+				A[i*(size_t)K+j]-=A[i*(size_t)K+k]*dot;
+		}
+		double dot=b[k];
+		for(size_t i=k+1; i<M; i++)
+			dot+=A[i*(size_t)K+k]*b[i];
+		dot *= tau;
+		b[k] -= dot;
+		for(size_t i=k+1; i<M; i++)
+			b[i]-=A[i*(size_t)K+k]*dot;
+	}
+	for(int i=K-1; i>=0; i--)
+	{
+		double z=b[i];
+		for(int j=i+1; j<K; j++)
+			z-=A[i*(size_t)K+j]*t[j];
+		t[i]=z/A[i*(size_t)K+i];
+	}
+	free(A);
+	free(b);
+	return 1;
+}
+
+static void predict_region(const int8_t*src,const uint8_t*valid,uint32_t h,uint32_t w,int H0,int W0,const double*t,int8_t*out)
+{
+	size_t n=(size_t)h*w;
+	memcpy(out,src,n);
+	/* MATLAB datafilling mode 0: invalid values become zero for LS features. */
+	int8_t *filled=malloc(n);
+	if(!filled)
+		return;
+	for(size_t i=0; i<n; i++)
+		filled[i]=valid[i]?src[i]:0;
+	for(uint32_t c=0; c<w; c++)
+		for(uint32_t r=0; r<h; r++)
+		{
+			if(r<(uint32_t)(H0-1))
+			{
+				if(c>0)
+					out[ix(r,c,h)]=out[ix(r,c-1,h)];
+			}
+			else if(c<(uint32_t)(W0-1))
+			{
+				out[ix(r,c,h)] = out[ix(r-1,c,h)];
+			}
+			else
+			{
+				double z=0;
+				int k=0;
+				for(int k1=0; k1<H0; k1++)
+					for(int k2=0; k2<W0; k2++)
+					{
+						if(k1==0&&k2==0)
+							continue;
+						z += filled[ix(r-k1,c-k2,h)]*t[k++];
+					}
+				out[ix(r,c,h)] = sat8(rnd_oct(z));
+			}
+		}
+	free(filled);
+}
+
+static int make_pred(const WCImage*im, int H0, int W0, uint32_t W1, const double*t, int8_t*pred)
+{
+	uint32_t h=im->h,w=im->w,W2=w-W1;
+	int8_t *r1=malloc((size_t)h*W1),*r2=malloc((size_t)h*W2);
+	if(!r1||!r2)
+	{
+		free(r1);
+		free(r2);
+		return 0;
+	}
+	double*t1=(double*)t,*t2=(double*)t+(H0*W0-1);
+	predict_region(im->v,im->valid,h,W1,H0,W0,t1,r1);
+	predict_region(im->v+(size_t)h*W1,im->valid+(size_t)h*W1,h,W2,H0,W0,t2,r2);
+	memcpy(pred,r1,(size_t)h*W1);
+	memcpy(pred+(size_t)h*W1,r2,(size_t)h*W2);
+	free(r1);
+	free(r2);
+	return 1;
+}
+
+static int write_file(const char*fn, const Buf*b)
+{
+	FILE*f=fopen(fn,"wb");
+	if(!f)
+		return 0;
+	int ok=fwrite(b->p,1,b->n,f)==b->n;
+	fclose(f);
+	return ok;
+}
+
+static int read_file(const char*fn, Buf*b)
+{
+	FILE*f=fopen(fn,"rb");
+	if(!f)
+		return 0;
+	fseek(f,0,SEEK_END);
+	long z=ftell(f);
+	rewind(f);
+	if(z<0)
+	{
+		fclose(f);
+		return 0;
+	}
+	b->p=malloc((size_t)z);
+	b->n=b->c=(size_t)z;
+	b->pos=0;
+	int ok=b->p&&fread(b->p,1,b->n,f)==b->n;
+	fclose(f);
+	return ok;
+}
+
+int wc_encode(const WCImage*im, const char*fn)
+{
+	const int H0=4,W0=4;
+	uint32_t h=im->h,w=im->w;
+	if(h<H0||w<W0)
+		return 0;
+	uint32_t *maxc = calloc(h,sizeof(uint32_t));
+	if(!maxc)
+		return 0;
+	uint32_t W1=w;
+	for(uint32_t r=0; r<h; r++)
+	{
+		int found=0;
+		int8_t mx=-128;
+		for(uint32_t c=0; c<w; c++)
+			if(im->valid[ix(r,c,h)]&&(!found||im->v[ix(r,c,h)]>mx))
+			{
+				mx=im->v[ix(r,c,h)];
+				maxc[r]=c;
+				found=1;
+			}
+		if(!found)
+			maxc[r]=0;
+		if(maxc[r]<W1)
+			W1=maxc[r];
+	}
+	if(W1<1)
+		W1=1;
+	if(W1>=w)
+		W1=w-1;
+	free(maxc);
+	uint32_t W2=w-W1;
+	double t[30]= {0};
+	if(!fit_ls(im->v,im->valid,h,W1,H0,W0,t)||!fit_ls(im->v+(size_t)h*W1,im->valid+(size_t)h*W1,h,W2,H0,W0,t+15))
+		return 0;
+	int8_t*pred = malloc((size_t)h*w);
+	if(!pred)
+		return 0;
+	if(!make_pred(im,H0,W0,W1,t,pred))
+	{
+		free(pred);
+		return 0;
+	}
+	uint64_t ctx[256][256];
+	memset(ctx, 0, sizeof(ctx));
+	uint8_t *symbols[256]= {0};
+	size_t counts[256]= {0},caps[256]= {0};
+	int first=1;
+	uint8_t p0=0;
+	for(size_t i=0; i<(size_t)h*w; i++)
+		if(im->valid[i])
+		{
+			int pv = (int)pred[i]+128, av=(int)im->v[i]+128;
+			if(pv<0||pv>255)
+			{
+				free(pred);
+				return 0;
+			}
+			if(first)
+			{
+				p0=(uint8_t)pv;
+				first=0;
+			}
+			ctx[pv][av]++;
+			if(counts[pv]==caps[pv])
+			{
+				size_t c=caps[pv]?caps[pv]*2:128;
+				void*q=realloc(symbols[pv],c);
+				if(!q)
+				{
+					free(pred);
+					return 0;
+				}
+				symbols[pv]=q;
+				caps[pv]=c;
+			}
+			symbols[pv][counts[pv]++]=(uint8_t)av;
+		}
+	if(first)
+	{
+		free(pred);
+		return 0;
+	}
+	WCPoint*pts=NULL;
+	size_t np=0;
+	for(int y=0; y<256; y++)
+		for(int x=0; x<256; x++)
+			if(ctx[y][x])
+				np++;
+	pts=calloc(np,sizeof(WCPoint));
+	if(!pts)
+	{
+		free(pred);
+		return 0;
+	}
+	size_t z=0;
+	for(int y=0; y<256; y++)
+		for(int x=0; x<256; x++)
+			if(ctx[y][x])
+				pts[z++]=(WCPoint){x,y,(uint32_t)ctx[y][x]};
+	uint8_t*oct=NULL;
+	size_t noct=0;
+	if(!oct_encode(pts,np,&oct,&noct))
+	{
+		free(pts);
+		free(pred);
+		return 0;
+	}
+	free(pts);
+	uint64_t oh[255]= {0};
+	for(size_t i=0; i<noct; i++)
+		oh[oct[i]-1]++;
+	unsigned ohN=1;
+	uint64_t maxoh=0;
+	for(int i=0; i<255; i++)
+		if(oh[i]>maxoh)maxoh=oh[i];
+	while(((uint64_t)1<<ohN)<=maxoh&&ohN<64)
+		ohN++;
+	uint8_t*packed=NULL;
+	size_t packedn=0;
+	if(!pack_counts(oh,ohN,&packed,&packedn))
+	{
+		free(oct);
+		free(pred);
+		return 0;
+	}
+	uint8_t*o_syms=malloc(noct);
+	if(!o_syms)
+	{
+		free(oct);
+		free(packed);
+		free(pred);
+		return 0;
+	}
+	for(size_t i=0; i<noct; i++)
+		o_syms[i]=oct[i]-1;
+	uint8_t* o_code=NULL;
+	size_t o_coden=0;
+	if(!ar_encode(o_syms,noct,oh,255,&o_code,&o_coden))
+	{
+		free(oct);
+		free(packed);
+		free(o_syms);
+		free(pred);
+		return 0;
+	}
+	Buf b= {0};
+	byte(&b,(uint8_t)ohN);
+	add(&b,packed,packedn);
+	putle(&b,o_coden,nbytes_for(noct));
+	add(&b,o_code,o_coden);
+	free(packed);
+	free(o_syms);
+	free(o_code);
+	free(oct);
+	char header[160];
+	int hn=snprintf(header,sizeof(header),"%u,%u,%u,%d,%d,%u,",h,W1,W2,H0,W0,p0);
+	add(&b,header,(size_t)hn);
+	for(int i=0; i<30; i++)
+	{
+		uint64_t raw;
+		memcpy(&raw,&t[i],8);
+		putle(&b,raw,8);
+	}
+	for(int c=0; c<256; c++)
+		if(counts[c])
+		{
+			uint64_t n=counts[c];
+			uint8_t*code=NULL;
+			size_t cn=0;
+			if(!ar_encode(symbols[c],counts[c],ctx[c],256,&code,&cn))
+			{
+				wc_bytes_free((WCBytes*)&b);
+				free(pred);
+				return 0;
+			}
+			putle(&b,cn,nbytes_for(n));
+			add(&b,code,cn);
+			free(code);
+		}
+	for(int c=0; c<256; c++)
+		free(symbols[c]);
+	free(pred);
+	int ok=write_file(fn,&b);
+	free(b.p);
+	return ok;
+}
+
+int wc_decode(const WCImage *mask, const char *fn, const char *outpng)
+{
+	Buf b= {0};
+	if(!read_file(fn,&b))
+		return 0;
+	if(b.n<2)
+		goto fail;
+	unsigned ohN=b.p[b.pos++];
+	if(ohN<1||ohN>32)
+		goto fail;
+	size_t pn=(255u*ohN+7)/8;
+	if(pn>b.n-b.pos)
+		goto fail;
+	uint64_t oh[255];
+	unpack_counts(b.p+b.pos,ohN,oh);
+	b.pos+=pn;
+	uint64_t noct=0;
+	for(int i=0; i<255; i++)
+		noct+=oh[i];
+	size_t lb=nbytes_for(noct);
+	if(lb>b.n-b.pos)
+		goto fail;
+	uint64_t ocl=getle(b.p+b.pos,lb);
+	b.pos+=lb;
+	if(ocl>b.n-b.pos||noct>SIZE_MAX)
+		goto fail;
+	uint8_t*os=malloc((size_t)noct);
+	if(!os)
+		goto fail;
+	if(!ar_decode(b.p+b.pos,(size_t)ocl,oh,255,(size_t)noct,os))
+	{
+		free(os);
+		goto fail;
+	}
+	b.pos+=(size_t)ocl;
+	uint8_t*oct=malloc((size_t)noct);
+	if(!oct)
+	{
+		free(os);
+		goto fail;
+	}
+	for(size_t i=0; i<(size_t)noct; i++)
+		oct[i]=os[i]+1;
+	free(os);
+	WCPoint*pts=NULL;
+	size_t np=0;
+	if(!oct_decode(oct,(size_t)noct,&pts,&np))
+	{
+		free(oct);
+		goto fail;
+	}
+	free(oct);
+	uint64_t ctx[256][256];
+	memset(ctx,0,sizeof(ctx));
+	int maxpred=0;
+	for(size_t i=0; i<np; i++)
+	{
+		if(pts[i].x>255||pts[i].y>255)
+		{
+			free(pts);
+			goto fail;
+		}
+		ctx[pts[i].y][pts[i].x]=pts[i].z;
+		if((int)pts[i].y>maxpred)
+			maxpred=(int)pts[i].y;
+	}
+	free(pts);
+	int vals[6],vi=0;
+	while(b.pos<b.n&&vi<6)
+	{
+		size_t st=b.pos;
+		while(b.pos<b.n&&b.p[b.pos]!=',')
+			b.pos++;
+		if(b.pos==b.n||b.pos-st>20)
+			goto fail;
+		char tmp[24];
+		memcpy(tmp,b.p+st,b.pos-st);
+		tmp[b.pos-st]=0;
+		vals[vi++]=atoi(tmp);
+		b.pos++;
+	}
+	if(vi!=6)
+		goto fail;
+	uint32_t h=vals[0],W1=vals[1],W2=vals[2];
+	int H0=vals[3],W0=vals[4];
+	uint8_t p0=(uint8_t)vals[5];
+	if(h!=mask->h||W1+W2!=mask->w||H0!=4||W0!=4)
+		goto fail;
+	double t[30];
+	if(b.n-b.pos<sizeof(t))
+		goto fail;
+	for(int i=0; i<30; i++)
+	{
+		uint64_t raw=getle(b.p+b.pos+8*i,8);
+		memcpy(&t[i],&raw,8);
+	}
+	b.pos+=sizeof(t);
+	uint8_t *decoded[256]= {0};
+	size_t dpos[256]= {0};
+	for(int c=0; c<=maxpred; c++)
+	{
+		uint64_t n=0;
+		for(int v=0; v<256; v++)
+			n+=ctx[c][v];
+		if(!n)
+			continue;
+		size_t nlb=nbytes_for(n);
+		if(nlb>b.n-b.pos)
+			goto fail;
+		uint64_t clen=getle(b.p+b.pos,nlb);
+		b.pos+=nlb;
+		if(clen>b.n-b.pos||n>SIZE_MAX)
+			goto fail;
+		decoded[c]=malloc((size_t)n);
+		if(!decoded[c])
+			goto fail;
+		if(!ar_decode(b.p+b.pos,(size_t)clen,ctx[c],256,(size_t)n,decoded[c]))
+			goto fail;
+		b.pos+=(size_t)clen;
+	}
+	if(b.pos!=b.n)
+		goto fail;
+	WCImage rec= {0};
+	rec.h=h;
+	rec.w=mask->w;
+	size_t N=(size_t)h*rec.w;
+	rec.v=calloc(N,1);
+	rec.valid=malloc(N);
+	if(!rec.v||!rec.valid)
+	{
+		wc_free_image(&rec);
+		goto fail;
+	}
+	memcpy(rec.valid,mask->valid,N);
+	int8_t *pred=calloc(N,1);
+	if(!pred)
+	{
+		wc_free_image(&rec);
+		goto fail;
+	}
+	size_t first_valid=SIZE_MAX;
+	for(size_t i=0; i<N; i++)
+		if(rec.valid[i])
+		{
+			first_valid=i;
+			break;
+		}
+	if(first_valid==SIZE_MAX)
+	{
+		free(pred);
+		wc_free_image(&rec);
+		goto fail;
+	}
+	for(size_t i=0; i<N; i++)
+	{
+		uint32_t r=(uint32_t)(i%h),gc=(uint32_t)(i/h),lc=gc<W1?gc:gc-W1;
+		const double*tc=gc<W1?t:t+15;
+		if(!rec.valid[i])
+		{
+			rec.v[i]=0;
+			/* Keep prediction borders defined where the source predictor defines them. */
+			if(r<(uint32_t)(H0-1)&&lc>0)
+				pred[i]=pred[ix(r,gc-1,h)];
+			else if(r>=(uint32_t)(H0-1)&&lc<(uint32_t)(W0-1))
+				pred[i]=pred[ix(r-1,gc,h)];
+			else if(r>=(uint32_t)(H0-1)&&lc>=(uint32_t)(W0-1))
+			{
+				double z=0;
+				int k=0;
+				for(int k1=0; k1<H0; k1++)
+					for(int k2=0; k2<W0; k2++)
+					{
+						if(!k1&&!k2)
+							continue;
+						uint32_t rr=r-k1,cc=lc-k2,gg=gc<W1?cc:W1+cc;
+						z+=(rec.valid[ix(rr,gg,h)]?rec.v[ix(rr,gg,h)]:0)*tc[k++];
+					}
+				pred[i]=sat8(rnd_oct(z));
+			}
+			continue;
+		}
+		int pv;
+		if(i==first_valid)
+			pv=p0;
+		else if(r<(uint32_t)(H0-1) && lc==0)
+		{
+			/* The legacy predictor leaves this first-column border unpredicted:
+			   its context equals the original sample. The PNG supplies that context
+			   selector; the sample itself is still read from the arithmetic stream. */
+			pv=(int)mask->v[i]+128;
+		}
+		else if(r<(uint32_t)(H0-1))
+		{
+			pv=(int)pred[ix(r,gc-1,h)]+128;
+		}
+		else if(lc<(uint32_t)(W0-1))
+		{
+			pv=(int)pred[ix(r-1,gc,h)]+128;
+		}
+		else
+		{
+			double z=0;
+			int k=0;
+			for(int k1=0; k1<H0; k1++)
+				for(int k2=0; k2<W0; k2++)
+				{
+					if(!k1&&!k2)
+						continue;
+					uint32_t rr=r-k1,cc=lc-k2,gg=gc<W1?cc:W1+cc;
+					z+=(rec.valid[ix(rr,gg,h)]?rec.v[ix(rr,gg,h)]:0)*tc[k++];
+				}
+			pv=(int)sat8(rnd_oct(z))+128;
+		}
+		uint64_t ctxn=0;
+		for(int q=0; q<256; q++)
+			ctxn+=ctx[pv][q];
+		if(pv<0||pv>255||!decoded[pv]||dpos[pv]>=ctxn)
+		{
+			free(pred);
+			wc_free_image(&rec);
+			goto fail;
+		}
+		uint8_t av=decoded[pv][dpos[pv]++];
+		rec.v[i]=(int8_t)((int)av-128);
+		pred[i]=(int8_t)(pv-128);
+	}
+	free(pred);
+	for(int c=0; c<256; c++)
+		free(decoded[c]);
+	free(b.p);
+	int ok=png_write_wc(outpng,&rec);
+	wc_free_image(&rec);
+	return ok;
+fail:
+	free(b.p);
+	return 0;
+}
